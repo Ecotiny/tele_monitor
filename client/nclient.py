@@ -2,9 +2,13 @@ import curses
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz, ICRS
 import astropy.units as u
 from astropy.time import Time
+from astroquery.simbad import Simbad
+Simbad.add_votable_fields("flux(V)")
 import numpy as np
 import time
 import json
+import os
+import sqlite3
 
 def static_vars(**kwargs):
     def decorate(func):
@@ -29,6 +33,32 @@ def ra_dec_to_map(scrn, ra, dec):
     decpx = (((dec + 90) / 180)*rows) + 1
 
     return int(rapx), int(decpx)
+
+def dec_to_dms(dec):
+    degrees = dec // 1
+    dec -= degrees
+    dec *= 60
+    minutes = dec // 1
+    dec -= minutes
+    dec *= 60
+    seconds = dec
+    return (int(degrees), int(minutes), seconds)
+
+def dms_to_dec(dms):
+    if type(dms) == str:
+        dms = [*map(float, dms.strip().split(" "))]
+    d, m, s = dms
+    dec = d
+    dec += m / 60
+    dec += s / 3600
+    return dec 
+
+def hms_to_dec(hms):
+    dec = dms_to_dec(hms) * 360/24
+    return dec 
+
+def dec_to_hms(dec):
+    return dec_to_dms(dec*24/360)
 
 # make this static, only update when time is significantly delta if it takes too long
 @static_vars(horizon=None, updated=Time.now())
@@ -64,44 +94,26 @@ def draw_labels(scrn):
     scrn.addstr(rows//2+1, 0,      " ")
 
 @static_vars(objs=None, bstars=None)
-def draw_objects(scrn):
+def draw_objects(scrn, curs, maglimit=5):
     if not draw_objects.bstars:
-        # read the list and then check
-        with open("bstars.json", "r") as f:
-            f.seek(0, 2)
-            if f.tell() > 5: 
-                f.seek(0,0)
-                draw_objects.bstars = json.load(f)
-            else:
-                # get list of 100 brightest stars
-                url = "https://raw.githubusercontent.com/aduboisforge/Bright-Star-Catalog-JSON/master/BSC.json"
-                # keys are "RA", "DEC", "MAG"
-                import requests # we only need it if it's not there already
-                print("updating bright star catalogue...")
-                r = requests.get(url)
-                outstars = []
-                for star in r.json():
-                    if float(star['MAG']) < 4:
-                        coordstr = f"{star['RA']} {star['DEC']}"
-                        coord = SkyCoord(coordstr, frame='icrs', unit=(u.hourangle, u.deg))
-                        rapx, decpx = ra_dec_to_map(scrn, coord.ra.deg, coord.dec.deg)
-                        outstars.append({"coords": coordstr, "rapx": rapx, "decpx": decpx, "mag": float(star['MAG'])})
-                draw_objects.bstars = {}
-                draw_objects.bstars['stars'] = outstars
-                with open("bstars.json", "w") as f:
-                    json.dump(draw_objects.bstars, f)
+        outstars = []
+        for star in curs.execute(f"SELECT * FROM catalogue WHERE mag < {maglimit};"):
+            tyc2, ra, dec, mag = star
+            rapx, decpx = ra_dec_to_map(scrn, ra, dec)
+            outstars.append({"rapx": rapx, "decpx": decpx, "mag": mag})
+        draw_objects.bstars = {}
+        draw_objects.bstars['stars'] = outstars
 
     for star in draw_objects.bstars['stars']:
-        if star['mag'] < 4:
-            mag_chart = ["0", "O", "o", "."]
-            char = mag_chart[0]
-            if star['mag'] > 0:
-                char = mag_chart[1]
-            if star['mag'] > 2:
-                char = mag_chart[2]
-            if star['mag'] > 3:
-                char = mag_chart[3]
-            scrn.addch(star['decpx'], star['rapx'], char, curses.color_pair(1))
+        mag_chart = ["0", "O", "o", "."]
+        char = mag_chart[0]
+        if star['mag'] > 1:
+            char = mag_chart[1]
+        if star['mag'] > 3:
+            char = mag_chart[2]
+        if star['mag'] > 4:
+            char = mag_chart[3]
+        scrn.addch(star['decpx'], star['rapx'], char, curses.color_pair(1))
 
     if not draw_objects.objs:
         with open("objs.json", "r") as f:
@@ -141,7 +153,8 @@ def draw_meridian(scrn):
         scrn.addch(dec, ra, "|", curses.color_pair(2))    
 
 @static_vars(history=[])
-def refresh_starmap(scrn, ra, dec):
+def refresh_starmap(scrn, ra, dec, curs):
+    # draw position of telescope
     newrapx, newdecpx = ra_dec_to_map(scrn, ra, dec)
     scrn.clear()
     for rapx, decpx in refresh_starmap.history: 
@@ -152,65 +165,121 @@ def refresh_starmap(scrn, ra, dec):
     if len(refresh_starmap.history) > 10:
         refresh_starmap.history = refresh_starmap.history[1:]
 
-    draw_objects(scrn)
-    draw_meridian(scrn)
-    scrn.addch(newdecpx, newrapx, "O", curses.color_pair(2)) # color pair 2 is red
+    draw_objects(scrn, curs)
     scrn.border()
     draw_labels(scrn)
+    draw_meridian(scrn)
     draw_horizon(scrn)
+    scrn.addch(newdecpx, newrapx, "O", curses.color_pair(2)) # color pair 2 is red
 
     scrn.refresh()
 
 def refresh_infopanel(scrn, info):
-    # info is a dict containing:
-    # ra, dec, target name, is_exposing, track rates(?)
+    # info is a dict containing key value pairs
     scrn.clear()
     scrn.border()
     scrn.addstr(0, 2, " Information ", curses.color_pair(1))
-    scrn.addstr(2, 2, f" RA: {info['ra']}", curses.color_pair(1))
-    scrn.addstr(3, 2, f"Dec: {info['dec']}", curses.color_pair(1))
-    scrn.addstr(5, 2, f"Target: {info['target']}", curses.color_pair(1))
+    for pos, field in enumerate(info):
+        scrn.addstr(2+pos, 2, f"{field}: {info[field]}", curses.color_pair(1))
     scrn.refresh()
 
-def dec_to_dms(dec):
-    degrees = dec // 1
-    dec -= degrees
-    dec *= 60
-    minutes = dec // 1
-    dec -= minutes
-    dec *= 60
-    seconds = dec
-    return (int(degrees), int(minutes), seconds)
+
+# static this too!
+@static_vars(stars=[], prev_radec=())
+def zoom_map(scrn, ra, dec, width, cursor):
+    # width is given in degrees
+    rows, cols = scrn.getmaxyx()
+    height = (width/cols) * rows
+    origin_ra = ra  - width/2
+    origin_de = dec - height/2
+    query = f"SELECT * FROM catalogue WHERE mRAdeg > {origin_ra} AND mRAdeg < {origin_ra + width} AND mDEdeg > {origin_de} AND mDEdeg < {origin_de + height};"
+    scrn.clear()
+    if zoom_map.prev_radec != (origin_ra, origin_de):
+        zoom_map.prev_radec = (origin_ra, origin_de)
+        stars = []
+        for star in cursor.execute(query):
+            tyc2, sra, sdec, mag = star
+#            scrn.addstr(4, 2, f"{sde:.2f} {sdec}", curses.color_pair(1))
+            d_ra = sra - origin_ra
+            d_de = sdec - origin_de
+            # scale up the delta values to +- 90 and 0-360
+            d_ra = d_ra * 360 / width
+            d_de = d_de * 90 / height * 2
+
+            # map to screen
+            d_ra, d_de = ra_dec_to_map(scrn, d_ra, d_de)
+
+            char = "O"
+            if mag > 8:
+                char = "o"
+            if mag > 10:
+                char = '.'
+
+            stars.append((d_ra, d_de, char))
+        
+        zoom_map.stars = stars
+   
+    for d_ra, d_de, char in zoom_map.stars:
+        scrn.addch(d_de, d_ra, char, curses.color_pair(1))
+
+    scrn.border()
+    scrn.addstr(0, 2, " Tight field ", curses.color_pair(1))
+
+    scrn.refresh()
+
+class Client:
+    def __init__(self, sidewidth=40, dbfn='tycho2.db'):
+        whole_win = curses.initscr()
+
+        curses.start_color()
+        curses.use_default_colors()
+
+        # Star color
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        
+        # Highlight color
+        curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+        
+        # Line colour
+        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
+
+        curses.cbreak()
+        
+        rows, cols = whole_win.getmaxyx()
+        self.starmap  = curses.newwin(rows, cols-sidewidth)
+        self.infobox  = curses.newwin(rows//2+1, sidewidth, 0, cols-sidewidth)
+        self.fieldbox = curses.newwin(rows//2, sidewidth, rows//2+1, cols-sidewidth)
+        self.conn = sqlite3.connect(dbfn)
+        self.curs = self.conn.cursor()
+
+    def update(self, ra, dec, info):
+        refresh_starmap(self.starmap, ra, dec, self.curs)
+
+        rad, ram, rasec = dec_to_dms(ra)
+        decd, decm, decsec = dec_to_dms(dec)
+        refresh_infopanel(self.infobox, info)
+        rah, rahm, rahsec = dec_to_hms(ra)
+        zoom_map(self.fieldbox, ra, dec, 5, self.curs)
+
+    def shutdown(self):
+        self.conn.close()
+        curses.endwin()
 
 if __name__ == "__main__":
-    
-    whole_win = curses.initscr()
-    curses.start_color()
-    curses.use_default_colors()
-
-    # Star color
-    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)
-    
-    # Highlight color
-    curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
-    
-    # Line colour
-    curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
-
-    curses.cbreak()
-    
-    rows, cols = whole_win.getmaxyx()
-    infowidth = 30
-    starmap = curses.newwin(rows, (2*cols//3))
-    infobox = curses.newwin(rows, cols//3, 0, (2*cols//3))
-
     n = 500
     ras = np.linspace(0, 360, n)
     decs = np.linspace(-90, 90, n)
-    for idx in range(n):
-        refresh_starmap(starmap, ras[idx], decs[idx])
-        rad, ram, rasec = dec_to_dms(ras[idx])
-        decd, decm, decsec = dec_to_dms(decs[idx])
-        refresh_infopanel(infobox, {'ra': f"+{rad:02d} {ram:02d}' {rasec:05.2f}\"", 'dec': f"{decd:02d} {decm:02d}' {decsec:05.2f}\"", 'target': idx})
-        time.sleep(0.1)
-    
+    cli = Client()
+    try:
+        for ra, dec in zip(ras, decs):
+            rad, ram, rasec = dec_to_dms(ra)
+            decd, decm, decsec = dec_to_dms(dec)
+            cli.update(ra, dec, {
+                "  RA": f"{rad} {ram} {rasec: 4.2f}",
+                " Dec": f"{decd} {decm} {decsec: 4.2f}",
+                " Tgt": "Testing object",
+                "Trck": "Sidereal"})
+    except KeyboardInterrupt:
+        cli.shutdown()
+
+
