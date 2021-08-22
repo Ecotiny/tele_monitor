@@ -87,10 +87,10 @@ def draw_labels(scrn):
     scrn.addstr(rows-1, cols//2-1, "  N  ")
     scrn.addstr(0, cols//2-1,      "  S  ")
     scrn.addstr(rows//2-1, cols-1, " ") 
-    scrn.addstr(rows//2, cols-1,   "E") 
+    scrn.addstr(rows//2, cols-1,   "W") 
     scrn.addstr(rows//2+1, cols-1, " ") 
     scrn.addstr(rows//2-1, 0,      " ")
-    scrn.addstr(rows//2, 0,        "W")
+    scrn.addstr(rows//2, 0,        "E")
     scrn.addstr(rows//2+1, 0,      " ")
 
 @static_vars(objs=None, bstars=None)
@@ -107,9 +107,9 @@ def draw_objects(scrn, curs, maglimit=5):
     for star in draw_objects.bstars['stars']:
         mag_chart = ["0", "O", "o", "."]
         char = mag_chart[0]
-        if star['mag'] > 1:
+        if star['mag'] > 0:
             char = mag_chart[1]
-        if star['mag'] > 3:
+        if star['mag'] > 1:
             char = mag_chart[2]
         if star['mag'] > 4:
             char = mag_chart[3]
@@ -126,7 +126,7 @@ def draw_objects(scrn, curs, maglimit=5):
     else:
         if draw_objects.objs != "NULL":
             for obj in draw_objects.objs:
-                coord = SkyCoord(obj['coords'], frame='icrs', unit=(u.deg, u.deg))
+                coord = SkyCoord(obj['coords'], frame='icrs', unit=(u.hour, u.deg))
                 rapx, decpx = ra_dec_to_map(scrn, coord.ra.deg, coord.dec.deg)
                 scrn.addch(decpx, rapx, obj['char'], curses.color_pair(1))
         
@@ -172,47 +172,44 @@ def refresh_starmap(scrn, ra, dec, curs):
     draw_horizon(scrn)
     scrn.addch(newdecpx, newrapx, "O", curses.color_pair(2)) # color pair 2 is red
 
-    scrn.refresh()
-
 def refresh_infopanel(scrn, info):
     # info is a dict containing key value pairs
     scrn.clear()
     scrn.border()
     scrn.addstr(0, 2, " Information ", curses.color_pair(1))
     for pos, field in enumerate(info):
-        scrn.addstr(2+pos, 2, f"{field}: {info[field]}", curses.color_pair(1))
-    scrn.refresh()
+        scrn.addstr(2+pos, 2, field, curses.color_pair(4)) # highlight
+        scrn.addstr(2+pos, 3+len(field), info[field], curses.color_pair(1))
 
-
-# static this too!
 @static_vars(stars=[], prev_radec=())
 def zoom_map(scrn, ra, dec, width, cursor):
     # width is given in degrees
     rows, cols = scrn.getmaxyx()
     height = (width/cols) * rows
     origin_ra = ra  - width/2
-    origin_de = dec - height/2
-    query = f"SELECT * FROM catalogue WHERE mRAdeg > {origin_ra} AND mRAdeg < {origin_ra + width} AND mDEdeg > {origin_de} AND mDEdeg < {origin_de + height};"
+    origin_de = dec# - height/2
+    query = f"SELECT * FROM catalogue WHERE mRAdeg > {origin_ra} AND mRAdeg < {origin_ra + width} AND mDEdeg > {origin_de} AND mDEdeg < {origin_de + height} AND mag < 10"
     scrn.clear()
     if zoom_map.prev_radec != (origin_ra, origin_de):
         zoom_map.prev_radec = (origin_ra, origin_de)
         stars = []
         for star in cursor.execute(query):
             tyc2, sra, sdec, mag = star
-#            scrn.addstr(4, 2, f"{sde:.2f} {sdec}", curses.color_pair(1))
             d_ra = sra - origin_ra
             d_de = sdec - origin_de
             # scale up the delta values to +- 90 and 0-360
             d_ra = d_ra * 360 / width
-            d_de = d_de * 90 / height * 2
+            d_de = d_de * 180 / height
 
             # map to screen
             d_ra, d_de = ra_dec_to_map(scrn, d_ra, d_de)
 
-            char = "O"
-            if mag > 8:
+            char = "0"
+            if mag > 4:
+                char = "O"
+            if mag > 6:
                 char = "o"
-            if mag > 10:
+            if mag > 8:
                 char = '.'
 
             stars.append((d_ra, d_de, char))
@@ -223,9 +220,9 @@ def zoom_map(scrn, ra, dec, width, cursor):
         scrn.addch(d_de, d_ra, char, curses.color_pair(1))
 
     scrn.border()
-    scrn.addstr(0, 2, " Tight field ", curses.color_pair(1))
+    scrn.addstr(0, 2, " A better name", curses.color_pair(1))
+    scrn.addch(rows//2, cols//2, "O", curses.color_pair(2))
 
-    scrn.refresh()
 
 class Client:
     def __init__(self, sidewidth=40, dbfn='tycho2.db'):
@@ -242,6 +239,9 @@ class Client:
         
         # Line colour
         curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
+
+        # extra highlighted
+        curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
 
         curses.cbreak()
         
@@ -260,6 +260,10 @@ class Client:
         refresh_infopanel(self.infobox, info)
         rah, rahm, rahsec = dec_to_hms(ra)
         zoom_map(self.fieldbox, ra, dec, 5, self.curs)
+
+        self.starmap.refresh()
+        self.infobox.refresh()
+        self.fieldbox.refresh()
 
     def shutdown(self):
         self.conn.close()
